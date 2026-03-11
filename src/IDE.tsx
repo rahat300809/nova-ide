@@ -116,7 +116,7 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
       setIsRunning(false);
     });
 
-    // Forward every keystroke to process stdin — node-pty echoes it back via 'output'
+    // Forward every keystroke to process stdin & echo locally
     term.onData((data) => {
       if (socketRef.current?.connected) {
         // Ctrl+C → send SIGINT
@@ -125,7 +125,16 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
           return;
         }
         socketRef.current.emit('stdin', data);
-        // No local echo needed: node-pty echoes the character back through proc.onData → 'output'
+        
+        // Local echo for better UX (some PTYs don't echo until Enter)
+        if (data === '\r') {
+          term.write('\r\n');
+        } else if (data === '\x7f' || data === '\b') {
+          // Backspace: move back, print space, move back
+          term.write('\b \b');
+        } else if (data >= ' ') {
+          term.write(data);
+        }
       }
     });
 
