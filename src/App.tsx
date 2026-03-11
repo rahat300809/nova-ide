@@ -24,23 +24,41 @@ export interface FileNode {
 export default function App() {
   const [user, setUser] = useState<any>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [view, setView] = useState<'landing' | 'auth' | 'dashboard' | 'editor'>('landing');
+  const [view, setView] = useState<'landing' | 'auth' | 'dashboard' | 'editor'>(() => {
+    return (localStorage.getItem('nova_view') as any) || 'landing';
+  });
   
   // App State
   const [files, setFiles] = useState<FileNode[]>([]);
-  const [activeFileId, setActiveFileId] = useState<string | null>(null);
-  const [openTabs, setOpenTabs] = useState<string[]>([]);
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [activeFileId, setActiveFileId] = useState<string | null>(() => localStorage.getItem('nova_active_file'));
+  const [openTabs, setOpenTabs] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem('nova_open_tabs') || '[]'); } catch { return []; }
+  });
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem('nova_expanded_folders') || '[]')); } catch { return new Set(); }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('nova_view', view);
+  }, [view]);
+
+  useEffect(() => {
+    if (activeFileId) localStorage.setItem('nova_active_file', activeFileId);
+    else localStorage.removeItem('nova_active_file');
+    localStorage.setItem('nova_open_tabs', JSON.stringify(openTabs));
+    localStorage.setItem('nova_expanded_folders', JSON.stringify(Array.from(expandedFolders)));
+  }, [activeFileId, openTabs, expandedFolders]);
   
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setAuthLoading(false);
       if (u) {
-        setView('dashboard');
+        setView(prev => (prev === 'landing' || prev === 'auth') ? 'dashboard' : prev);
         fetchFiles(u.uid);
       } else {
         setView('landing');
+        localStorage.removeItem('nova_view');
       }
     });
     return unsub;
@@ -49,7 +67,21 @@ export default function App() {
   const fetchFiles = async (uid: string) => {
     const q = query(collection(db, 'files'), where('userId', '==', uid));
     const snapshot = await getDocs(q);
-    const loadedFiles = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as FileNode));
+    const loadedFiles = snapshot.docs.map(d => {
+      const data = d.data();
+      let content = data.content;
+      
+      // Auto-recover any unsaved drafts from localStorage in case of rapid refresh
+      const draft = localStorage.getItem(`nova_draft_${d.id}`);
+      if (draft !== null && draft !== content) {
+        content = draft;
+        // Background sync the draft up to firebase
+        updateDoc(doc(db, 'files', d.id), { content: draft })
+          .then(() => localStorage.removeItem(`nova_draft_${d.id}`))
+          .catch(console.error);
+      }
+      return { id: d.id, ...data, content } as FileNode;
+    });
     setFiles(loadedFiles);
   };
 

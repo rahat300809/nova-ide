@@ -167,8 +167,9 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
     setConsoleTab('output');
 
     try {
-      const backendUrl = import.meta.env.VITE_BACKEND_URL || (import.meta.env.PROD ? 'https://nova-ide.onrender.com' : 'http://localhost:3000');
-      const res = await fetch(`${backendUrl}/api/execute`, {
+      // In production, target the Render backend. In dev, Vite proxy forwards /api to port 3000.
+      const apiBase = import.meta.env.VITE_BACKEND_URL || (import.meta.env.PROD ? 'https://nova-ide.onrender.com' : '');
+      const res = await fetch(`${apiBase}/api/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
