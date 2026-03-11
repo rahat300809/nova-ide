@@ -2,11 +2,8 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
-import { spawn } from "child_process";
-import fs from "fs";
 import cors from "cors";
-import { createServer } from "http";
-import { Server } from "socket.io";
+import axios from "axios";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -14,141 +11,100 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
+// Judge0 CE — free, no key needed for ce.judge0.com (public instance)
+const JUDGE0_URL = "https://ce.judge0.com";
+
+// Language IDs from Judge0
+const LANGUAGE_MAP: Record<string, number> = {
+  python:     71,  // Python 3.8.1
+  py:         71,
+  c:          50,  // C (GCC 9.2.0)
+  cpp:        54,  // C++ (GCC 9.2.0)
+  "c++":      54,
+  javascript: 93,  // JavaScript (Node.js 18.15.0)
+  js:         93,
+};
+
+// --- Judge0 Code Execution Endpoint ---
+app.post("/api/execute", async (req: any, res: any) => {
+  const { language, code, stdin } = req.body;
+
+  if (!language || !code) {
+    return res.status(400).json({ success: false, error: "language and code are required." });
   }
-});
 
-// --- WebSocket Code Execution Sandbox ---
-io.on("connection", (socket) => {
-  let currentProcess: any = null;
-  let tempDir: string | null = null;
+  const languageId = LANGUAGE_MAP[language.toLowerCase()];
+  if (!languageId) {
+    return res.status(400).json({ success: false, error: `Unsupported language: ${language}` });
+  }
 
-  socket.on("execute", async (data) => {
-    const { code, language, fileName } = data;
-    
-    // Cleanup any existing process on this socket
-    if (currentProcess) {
-       currentProcess.kill();
+  try {
+    // Step 1: Submit the code
+    const submitRes = await axios.post(
+      `${JUDGE0_URL}/submissions?base64_encoded=false&wait=false`,
+      {
+        language_id: languageId,
+        source_code: code,
+        stdin: stdin || "",
+        cpu_time_limit: 5,
+        wall_time_limit: 10,
+      },
+      { timeout: 15000 }
+    );
+
+    const token = submitRes.data.token;
+    if (!token) {
+      return res.status(500).json({ success: false, error: "Failed to submit code to execution service." });
     }
 
-    // Create a unique temporary directory for this execution
-    const executionId = Math.random().toString(36).substring(2, 15);
-    tempDir = path.join(__dirname, "temp", executionId);
-    
-    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-
-    const safeFileName = fileName ? fileName.replace(/[^a-zA-Z0-9.\-_]/g, '') : `temp_code.${language}`;
-    const filePath = path.join(tempDir, safeFileName);
-    fs.writeFileSync(filePath, code);
-
-    let command = "";
-    let args: string[] = [];
-
-    // Inject C:\mingw64\bin into PATH for Windows local testing
-    const execEnv = { ...process.env };
-    if (process.platform === "win32") {
-      execEnv.PATH = `C:\\mingw64\\bin;${execEnv.PATH || ""}`;
+    // Step 2: Poll for result (max ~10 seconds)
+    let result: any = null;
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const pollRes = await axios.get(
+        `${JUDGE0_URL}/submissions/${token}?base64_encoded=false`,
+        { timeout: 10000 }
+      );
+      result = pollRes.data;
+      // Status IDs 1 and 2 mean "In Queue" / "Processing"
+      if (result.status?.id > 2) break;
     }
 
-    // Pre-compilation step for C/C++
-    if (language === "c" || language === "cpp" || language === "c++") {
-      const outPath = path.join(tempDir, "output.exe");
-      const compileCmd = language === "c" ? "gcc" : "g++";
-      
-      socket.emit("output", `Compiling ${safeFileName}...\r\n`);
-      
-      try {
-        const compileProcess = spawn(compileCmd, [filePath, "-o", outPath], { env: execEnv });
-        await new Promise((resolve, reject) => {
-          compileProcess.on('close', (code) => {
-            if (code === 0) resolve(true);
-            else reject(new Error(`Compilation failed with exit code ${code}`));
-          });
-          compileProcess.stderr.on('data', (data) => socket.emit("output", `\x1b[31m${data.toString()}\x1b[0m`));
-        });
-        
-        command = outPath;
-        // On Linux/Render, use stdbuf to disable compiled bin buffering so interactive prompts show up immediately.
-        if (process.platform === 'linux') {
-          command = 'stdbuf';
-          args = ['-i0', '-o0', '-e0', outPath];
-        } else {
-          command = outPath;
-        }
-      } catch (err: any) {
-        socket.emit("output", `\x1b[31mCompilation Error: ${err.message}\x1b[0m\r\n`);
-        socket.emit("execution_finished");
-        return;
-      }
-    } else if (language === "python" || language === "py") {
-      command = "python3";
-      args = ["-u", filePath]; // -u prevents python from buffering stdout
-    } else if (language === "javascript" || language === "js") {
-      command = "node";
-      args = [filePath];
-    } else {
-      socket.emit("output", `Unsupported language: ${language}\r\n`);
-      socket.emit("execution_finished");
-      return;
+    if (!result) {
+      return res.status(500).json({ success: false, error: "Execution timed out." });
     }
 
-    try {
-      currentProcess = spawn(command, args, { cwd: tempDir, env: execEnv });
+    const statusId = result.status?.id;
+    const stdout = result.stdout || "";
+    const stderr = result.stderr || "";
+    const compileOutput = result.compile_output || "";
 
-      currentProcess.stdout.on("data", (data: Buffer) => {
-        // Convert \n to \r\n for xterm.js
-        socket.emit("output", data.toString().replace(/\n/g, '\r\n'));
-      });
-
-      currentProcess.stderr.on("data", (data: Buffer) => {
-        socket.emit("output", `\x1b[31m${data.toString().replace(/\n/g, '\r\n')}\x1b[0m`);
-      });
-
-      currentProcess.on("close", (code: number) => {
-        socket.emit("output", `\r\n\x1b[33m[Process exited with code ${code}]\x1b[0m\r\n`);
-        socket.emit("execution_finished");
-        currentProcess = null;
-        cleanup();
-      });
-
-      // 5 minute absolute hard timeout
-      setTimeout(() => {
-        if (currentProcess) {
-          socket.emit("output", "\r\n\x1b[31m[Execution Timeout (5 minutes)]\x1b[0m\r\n");
-          currentProcess.kill();
-        }
-      }, 5 * 60 * 1000);
-
-    } catch (err: any) {
-       socket.emit("output", `\x1b[31mFailed to start process: ${err.message}\x1b[0m\r\n`);
-       socket.emit("execution_finished");
-       cleanup();
+    // Status IDs: 3=Accepted, 4=WrongAnswer, 5=TLE, 6=CompileError, etc.
+    if (statusId === 6) {
+      // Compile Error
+      return res.json({ success: false, output: "", error: compileOutput, type: "compile_error" });
     }
-  });
 
-  socket.on("input", (data: string) => {
-    if (currentProcess && currentProcess.stdin) {
-      currentProcess.stdin.write(data);
+    if (statusId === 5) {
+      return res.json({ success: false, output: stdout, error: "Time Limit Exceeded (5 seconds)", type: "tle" });
     }
-  });
 
-  socket.on("disconnect", () => {
-    if (currentProcess) currentProcess.kill();
-    cleanup();
-  });
-
-  function cleanup() {
-    if (tempDir && fs.existsSync(tempDir)) {
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      } catch (e) {
-        console.error("Cleanup error:", e);
-      }
-    }
+    const isSuccess = statusId === 3;
+    return res.json({
+      success: isSuccess,
+      output: stdout,
+      error: stderr || (isSuccess ? "" : (result.status?.description || "Runtime Error")),
+      type: isSuccess ? "success" : "runtime_error",
+      exitCode: result.exit_code,
+    });
+  } catch (err: any) {
+    console.error("Judge0 error:", err?.response?.data || err.message);
+    return res.status(500).json({
+      success: false,
+      output: "",
+      error: "Execution service unavailable. Please try again.",
+      type: "server_error",
+    });
   }
 });
 
@@ -160,28 +116,16 @@ async function startServer() {
       server: { middlewareMode: true },
       appType: "spa",
     });
-
-    // Bypass Vite's SPA fallback for socket.io requests
-    app.use((req, res, next) => {
-      if (req.url.startsWith('/socket.io')) {
-        return; // Halt Express, let Engine.IO handle it
-      }
-      vite.middlewares(req, res, next);
-    });
+    app.use(vite.middlewares);
   } else {
     app.use(express.static(path.join(__dirname, "dist")));
-    
-    // Bypass SPA fallback for socket.io requests in production
-    app.get("*", (req, res, next) => {
-      if (req.url.startsWith('/socket.io')) {
-        return; 
-      }
+    app.get("*", (req: any, res: any) => {
       res.sendFile(path.join(__dirname, "dist", "index.html"));
     });
   }
 
-  httpServer.listen(PORT, () => {
-    console.log(`Nova IDE Sandbox & Server running on http://localhost:${PORT}`);
+  app.listen(PORT, () => {
+    console.log(`Nova IDE running on http://localhost:${PORT}`);
   });
 }
 

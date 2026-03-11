@@ -13,25 +13,17 @@ import { jsPDF } from 'jspdf';
 import { cn } from './components/Button';
 import { doc, setDoc, deleteDoc, updateDoc, collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from './firebase';
-import { Terminal as XTerm } from 'xterm';
-import { FitAddon } from 'xterm-addon-fit';
-import 'xterm/css/xterm.css';
-import { io, Socket } from 'socket.io-client';
 
 export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, openTabs, setOpenTabs, expandedFolders, setExpandedFolders, onBackToDashboard, onLogout }: any) {
   
   const [output, setOutput] = useState('');
+  const [outputError, setOutputError] = useState('');
   const [isRunning, setIsRunning] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
-  
-  // Terminal State
-  const terminalRef = useRef<HTMLDivElement>(null);
-  const xtermRef = useRef<XTerm | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
-  const socketRef = useRef<Socket | null>(null);
-  const executionBuffer = useRef<string>('');
+  const [stdinValue, setStdinValue] = useState('');
+  const [consoleTab, setConsoleTab] = useState<'output' | 'input'>('output');
   
   // Custom Modal State
   const [createModal, setCreateModal] = useState<{ isOpen: boolean; type: 'file' | 'folder'; parentId: string | null }>({
@@ -56,85 +48,6 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
 
   const saveTimeoutRef = useRef<any>(null);
 
-  useEffect(() => {
-    if (!terminalRef.current) return;
-
-    // Initialize xterm.js
-    const term = new XTerm({
-      cursorBlink: true,
-      fontFamily: 'JetBrains Mono, monospace',
-      fontSize: 13,
-      theme: {
-        background: '#1e1e1e',
-        foreground: '#d4d4d4',
-        cursor: '#fff',
-        selectionBackground: 'rgba(255, 255, 255, 0.3)'
-      }
-    });
-
-    const fitAddon = new FitAddon();
-    term.loadAddon(fitAddon);
-    term.open(terminalRef.current);
-    fitAddon.fit();
-
-    xtermRef.current = term;
-    fitAddonRef.current = fitAddon;
-
-    term.writeln('Welcome to the Nova Code Execution Engine.');
-    term.writeln('Press "Run" to execute your code.');
-
-    const resizeObserver = new ResizeObserver(() => {
-      try { fitAddon.fit(); } catch (e) {}
-    });
-    resizeObserver.observe(terminalRef.current);
-
-    // Initialize Socket.io
-    const backendUrl = import.meta.env.VITE_BACKEND_URL || (import.meta.env.PROD ? 'https://nova-ide.onrender.com' : 'http://localhost:3000');
-    const socket = io(backendUrl);
-    socketRef.current = socket;
-
-    socket.on("output", (data: string) => {
-      term.write(data);
-    });
-
-    socket.on("execution_finished", () => {
-      setIsRunning(false);
-    });
-
-    socket.on("connect_error", (err) => {
-      console.error("Socket connection error:", err);
-      term.writeln(`\r\n\x1b[31mConnection error: ${err.message}\x1b[0m`);
-    });
-
-    // Handle user typing directly into the terminal
-    term.onData((data) => {
-      if (isRunning && socketRef.current) {
-        socketRef.current.emit("input", data);
-        // Local echo for typical characters (newline helps formatting)
-        if (data === '\r') {
-          term.write('\r\n');
-        } else {
-          term.write(data);
-        }
-      }
-    });
-
-    return () => {
-      resizeObserver.disconnect();
-      term.dispose();
-      socket.disconnect();
-    };
-  }, []); // Empty deps so terminal is mounted once
-
-  // Fit terminal when sidebar toggles or tab changes
-  useEffect(() => {
-    const timeout = setTimeout(() => {
-      if (fitAddonRef.current) {
-        try { fitAddonRef.current.fit(); } catch(e){}
-      }
-    }, 300);
-    return () => clearTimeout(timeout);
-  }, [isSidebarOpen, activeFileId]);
 
   const openCreateModal = (type: 'file' | 'folder', parentId: string | null = null) => {
     setCreateModal({ isOpen: true, type, parentId });
@@ -247,17 +160,38 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
   const runCode = async () => {
     const activeFile = files.find((f: any) => f.id === activeFileId);
     if (!activeFile || activeFile.type !== 'file') return;
-    if (!socketRef.current || !xtermRef.current) return;
 
     setIsRunning(true);
-    xtermRef.current.clear();
-    xtermRef.current.writeln(`\x1b[36m> Executing ${activeFile.name}...\x1b[0m\r\n`);
+    setOutput('');
+    setOutputError('');
+    setConsoleTab('output');
 
-    socketRef.current.emit("execute", {
-      code: activeFile.content,
-      language: activeFile.language,
-      fileName: activeFile.name
-    });
+    try {
+      const backendUrl = import.meta.env.VITE_BACKEND_URL || (import.meta.env.PROD ? 'https://nova-ide.onrender.com' : 'http://localhost:3000');
+      const res = await fetch(`${backendUrl}/api/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          language: activeFile.language,
+          code: activeFile.content,
+          stdin: stdinValue,
+          fileName: activeFile.name,
+        }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        setOutput(result.output || '(no output)');
+        setOutputError(result.error || '');
+      } else {
+        setOutput('');
+        setOutputError(result.error || 'Unknown error');
+      }
+    } catch (e: any) {
+      setOutput('');
+      setOutputError('Could not connect to execution server. Check your connection.');
+    } finally {
+      setIsRunning(false);
+    }
   };
 
   const downloadFile = (file: FileNode) => {
@@ -526,30 +460,62 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
             )}
           </div>
 
-          {/* Bottom Terminal Panel */}
-          <div className="h-[30%] min-h-[150px] border-t border-slate-200 flex flex-col bg-[#1e1e1e] text-slate-300 relative z-10">
-            <div className="h-10 bg-[#2d2d2d] px-4 flex items-center justify-between border-b border-[#1e1e1e]">
-              <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-[#9cdcfe]">
-                <Terminal size={14} />
-                Interactive Terminal
+          {/* Bottom Console Panel */}
+          <div className="h-[32%] min-h-[160px] border-t border-slate-200 flex flex-col bg-[#1e1e1e] text-slate-300 relative z-10">
+            {/* Tab bar */}
+            <div className="h-10 bg-[#2d2d2d] px-4 flex items-center justify-between border-b border-[#111]">
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setConsoleTab('output')}
+                  className={cn(
+                    "flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-widest px-3 py-2 border-b-2 transition-colors",
+                    consoleTab === 'output' ? "text-[#9cdcfe] border-[#9cdcfe]" : "text-slate-500 border-transparent hover:text-slate-300"
+                  )}
+                >
+                  <Terminal size={13} /> Output
+                </button>
+                <button
+                  onClick={() => setConsoleTab('input')}
+                  className={cn(
+                    "flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-widest px-3 py-2 border-b-2 transition-colors",
+                    consoleTab === 'input' ? "text-[#ce9178] border-[#ce9178]" : "text-slate-500 border-transparent hover:text-slate-300"
+                  )}
+                >
+                  <FileText size={13} /> Stdin (Input)
+                </button>
               </div>
-              
-              <button 
-                onClick={() => {
-                  if (xtermRef.current) {
-                    xtermRef.current.clear();
-                    xtermRef.current.write('Console cleared.\r\n');
-                  }
-                }} 
-                className="p-1.5 hover:bg-white/10 rounded flex items-center gap-2 text-xs transition-colors" 
-                title="Clear Console"
+              <button
+                onClick={() => { setOutput(''); setOutputError(''); }}
+                className="p-1.5 hover:bg-white/10 rounded flex items-center gap-1.5 text-xs text-slate-400 transition-colors"
               >
-                <Trash2 size={12} className="text-slate-400" />
-                Clear
+                <Trash2 size={12} /> Clear
               </button>
             </div>
-            <div className="flex-1 relative bg-[#1e1e1e] p-2">
-              <div ref={terminalRef} className="w-full h-full" />
+
+            {/* Panel content */}
+            <div className="flex-1 overflow-hidden relative">
+              {consoleTab === 'output' ? (
+                <div className="absolute inset-0 overflow-y-auto p-4 font-mono text-sm whitespace-pre-wrap leading-relaxed">
+                  {isRunning ? (
+                    <span className="text-slate-500 animate-pulse">Running…</span>
+                  ) : output || outputError ? (
+                    <>
+                      {output && <span className="text-slate-200">{output}</span>}
+                      {outputError && <span className="text-red-400 block mt-1">{outputError}</span>}
+                    </>
+                  ) : (
+                    <span className="text-slate-600 select-none">No output yet. Press Run ▶ to execute your code.</span>
+                  )}
+                </div>
+              ) : (
+                <textarea
+                  value={stdinValue}
+                  onChange={(e) => setStdinValue(e.target.value)}
+                  placeholder={"Enter stdin here — one value per line.\nExample:\n3\nAlice\n42"}
+                  className="absolute inset-0 w-full h-full bg-[#1e1e1e] text-slate-300 p-4 font-mono text-sm resize-none focus:outline-none placeholder-slate-600"
+                  spellCheck={false}
+                />
+              )}
             </div>
           </div>
         </main>
