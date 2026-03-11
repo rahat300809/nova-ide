@@ -13,6 +13,10 @@ import { jsPDF } from 'jspdf';
 import { cn } from './components/Button';
 import { doc, setDoc, deleteDoc, updateDoc, collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from './firebase';
+import { Terminal as XTerm } from 'xterm';
+import { FitAddon } from 'xterm-addon-fit';
+import 'xterm/css/xterm.css';
+import { io as socketIO, Socket } from 'socket.io-client';
 
 export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, openTabs, setOpenTabs, expandedFolders, setExpandedFolders, onBackToDashboard, onLogout }: any) {
   
@@ -22,8 +26,12 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
   const [searchTerm, setSearchTerm] = useState('');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
-  const [stdinValue, setStdinValue] = useState('');
-  const [consoleTab, setConsoleTab] = useState<'output' | 'input'>('output');
+
+  // Terminal
+  const terminalRef = useRef<HTMLDivElement>(null);
+  const xtermRef = useRef<XTerm | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const socketRef = useRef<Socket | null>(null);
   
   // Custom Modal State
   const [createModal, setCreateModal] = useState<{ isOpen: boolean; type: 'file' | 'folder'; parentId: string | null }>({
@@ -47,6 +55,87 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
   };
 
   const saveTimeoutRef = useRef<any>(null);
+
+  // Init xterm.js + socket.io once
+  useEffect(() => {
+    if (!terminalRef.current) return;
+
+    const term = new XTerm({
+      cursorBlink: true,
+      fontFamily: '"JetBrains Mono", "Fira Code", Consolas, monospace',
+      fontSize: 13,
+      theme: {
+        background: '#1e1e1e', foreground: '#d4d4d4', cursor: '#aeafad',
+        black: '#1e1e1e',   brightBlack: '#808080',
+        red: '#f44747',     brightRed: '#f44747',
+        green: '#6a9955',   brightGreen: '#b5cea8',
+        yellow: '#d7ba7d',  brightYellow: '#d7ba7d',
+        blue: '#569cd6',    brightBlue: '#9cdcfe',
+        magenta: '#c586c0', brightMagenta: '#c586c0',
+        cyan: '#4fc1ff',    brightCyan: '#4fc1ff',
+        white: '#d4d4d4',   brightWhite: '#ffffff',
+      }
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(terminalRef.current);
+    fit.fit();
+    xtermRef.current = term;
+    fitAddonRef.current = fit;
+
+    term.writeln('\x1b[36m  Nova IDE — Interactive Terminal\x1b[0m');
+    term.writeln('\x1b[90m  Press \x1b[32mRun ▶\x1b[90m to execute. Supports real-time input.\x1b[0m');
+    term.writeln('');
+
+    // Connect socket to the same origin (works on any port, local or deployed)
+    const backendUrl = import.meta.env.VITE_BACKEND_URL ||
+      (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000');
+    const socket = socketIO(backendUrl, { transports: ['websocket', 'polling'] });
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      term.writeln('\x1b[90m  [connected to execution server]\x1b[0m\r\n');
+    });
+    socket.on('connect_error', () => {
+      term.writeln('\x1b[31m  [could not connect — is the server running?]\x1b[0m\r\n');
+    });
+    socket.on('output', (data: string) => {
+      term.write(data);
+    });
+    socket.on('execution_finished', () => {
+      setIsRunning(false);
+    });
+
+    // Forward every keystroke to process stdin in real-time
+    term.onData((data) => {
+      if (socketRef.current?.connected) {
+        // Ctrl+C → send SIGINT
+        if (data === '\x03') {
+          socketRef.current.emit('kill');
+          term.writeln('^C');
+          return;
+        }
+        socketRef.current.emit('stdin', data);
+        // Echo printable chars and handle backspace locally for UX
+        if (data === '\r') {
+          term.write('\r\n');
+        } else if (data === '\x7f' || data === '\b') {
+          term.write('\b \b');
+        } else if (data >= ' ') {
+          term.write(data);
+        }
+      }
+    });
+
+    const ro = new ResizeObserver(() => { try { fit.fit(); } catch(e){} });
+    ro.observe(terminalRef.current);
+    return () => { ro.disconnect(); term.dispose(); socket.disconnect(); };
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => { try { fitAddonRef.current?.fit(); } catch(e){} }, 300);
+    return () => clearTimeout(t);
+  }, [isSidebarOpen, activeFileId]);
 
 
   const openCreateModal = (type: 'file' | 'folder', parentId: string | null = null) => {
@@ -157,42 +246,24 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
     }, 500); // 500ms debounce
   };
 
-  const runCode = async () => {
+  const runCode = () => {
     const activeFile = files.find((f: any) => f.id === activeFileId);
     if (!activeFile || activeFile.type !== 'file') return;
+    const socket = socketRef.current;
+    const term = xtermRef.current;
+    if (!socket || !term) return;
 
     setIsRunning(true);
-    setOutput('');
-    setOutputError('');
-    setConsoleTab('output');
+    term.writeln('');
+    term.writeln(`\x1b[36m▶ Running ${activeFile.name}\x1b[0m`);
+    term.writeln('\x1b[90m─────────────────────────────────────────────\x1b[0m');
+    term.focus();
 
-    try {
-      // In production, target the Render backend. In dev, Vite proxy forwards /api to port 3000.
-      const apiBase = import.meta.env.VITE_BACKEND_URL || (import.meta.env.PROD ? 'https://nova-ide.onrender.com' : '');
-      const res = await fetch(`${apiBase}/api/execute`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          language: activeFile.language,
-          code: activeFile.content,
-          stdin: stdinValue,
-          fileName: activeFile.name,
-        }),
-      });
-      const result = await res.json();
-      if (result.success) {
-        setOutput(result.output || '(no output)');
-        setOutputError(result.error || '');
-      } else {
-        setOutput('');
-        setOutputError(result.error || 'Unknown error');
-      }
-    } catch (e: any) {
-      setOutput('');
-      setOutputError('Could not connect to execution server. Check your connection.');
-    } finally {
-      setIsRunning(false);
-    }
+    socket.emit('execute', {
+      code: activeFile.content,
+      language: activeFile.language,
+      fileName: activeFile.name,
+    });
   };
 
   const downloadFile = (file: FileNode) => {
@@ -461,63 +532,22 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
             )}
           </div>
 
-          {/* Bottom Console Panel */}
-          <div className="h-[32%] min-h-[160px] border-t border-slate-200 flex flex-col bg-[#1e1e1e] text-slate-300 relative z-10">
-            {/* Tab bar */}
-            <div className="h-10 bg-[#2d2d2d] px-4 flex items-center justify-between border-b border-[#111]">
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => setConsoleTab('output')}
-                  className={cn(
-                    "flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-widest px-3 py-2 border-b-2 transition-colors",
-                    consoleTab === 'output' ? "text-[#9cdcfe] border-[#9cdcfe]" : "text-slate-500 border-transparent hover:text-slate-300"
-                  )}
-                >
-                  <Terminal size={13} /> Output
-                </button>
-                <button
-                  onClick={() => setConsoleTab('input')}
-                  className={cn(
-                    "flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-widest px-3 py-2 border-b-2 transition-colors",
-                    consoleTab === 'input' ? "text-[#ce9178] border-[#ce9178]" : "text-slate-500 border-transparent hover:text-slate-300"
-                  )}
-                >
-                  <FileText size={13} /> Stdin (Input)
-                </button>
+          {/* Unified VS Code-style Terminal */}
+          <div className="h-[35%] min-h-[180px] border-t border-[#333] flex flex-col" style={{background:'#1e1e1e'}}>
+            <div className="flex items-center justify-between px-4 py-1.5 bg-[#252526] border-b border-[#111]">
+              <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-[#9cdcfe]">
+                <Terminal size={13} />
+                <span>Terminal</span>
+                {isRunning && <span className="text-[#d7ba7d] animate-pulse ml-2">● Running</span>}
               </div>
               <button
-                onClick={() => { setOutput(''); setOutputError(''); }}
-                className="p-1.5 hover:bg-white/10 rounded flex items-center gap-1.5 text-xs text-slate-400 transition-colors"
+                onClick={() => { xtermRef.current?.clear(); xtermRef.current?.writeln('\x1b[90mTerminal cleared.\x1b[0m'); }}
+                className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-300 px-2 py-1 rounded hover:bg-white/10 transition-colors"
               >
-                <Trash2 size={12} /> Clear
+                <Trash2 size={11} /> Clear
               </button>
             </div>
-
-            {/* Panel content */}
-            <div className="flex-1 overflow-hidden relative">
-              {consoleTab === 'output' ? (
-                <div className="absolute inset-0 overflow-y-auto p-4 font-mono text-sm whitespace-pre-wrap leading-relaxed">
-                  {isRunning ? (
-                    <span className="text-slate-500 animate-pulse">Running…</span>
-                  ) : output || outputError ? (
-                    <>
-                      {output && <span className="text-slate-200">{output}</span>}
-                      {outputError && <span className="text-red-400 block mt-1">{outputError}</span>}
-                    </>
-                  ) : (
-                    <span className="text-slate-600 select-none">No output yet. Press Run ▶ to execute your code.</span>
-                  )}
-                </div>
-              ) : (
-                <textarea
-                  value={stdinValue}
-                  onChange={(e) => setStdinValue(e.target.value)}
-                  placeholder={"Enter stdin here — one value per line.\nExample:\n3\nAlice\n42"}
-                  className="absolute inset-0 w-full h-full bg-[#1e1e1e] text-slate-300 p-4 font-mono text-sm resize-none focus:outline-none placeholder-slate-600"
-                  spellCheck={false}
-                />
-              )}
-            </div>
+            <div ref={terminalRef} className="flex-1" />
           </div>
         </main>
       </div>

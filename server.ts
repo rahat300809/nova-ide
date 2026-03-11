@@ -3,111 +3,165 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import cors from "cors";
-import axios from "axios";
+import { createServer } from "http";
+import { Server } from "socket.io";
+import { spawn } from "child_process";
+import fs from "fs";
+import os from "os";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
 const app = express();
 app.use(express.json());
-app.use(cors());
+app.use(cors({ origin: "*" }));
 
-// Judge0 CE — free, no key needed for ce.judge0.com (public instance)
-const JUDGE0_URL = "https://ce.judge0.com";
-
-// Language IDs from Judge0
-const LANGUAGE_MAP: Record<string, number> = {
-  python:     71,  // Python 3.8.1
-  py:         71,
-  c:          50,  // C (GCC 9.2.0)
-  cpp:        54,  // C++ (GCC 9.2.0)
-  "c++":      54,
-  javascript: 93,  // JavaScript (Node.js 18.15.0)
-  js:         93,
-};
-
-// --- Judge0 Code Execution Endpoint ---
-app.post("/api/execute", async (req: any, res: any) => {
-  const { language, code, stdin } = req.body;
-
-  if (!language || !code) {
-    return res.status(400).json({ success: false, error: "language and code are required." });
-  }
-
-  const languageId = LANGUAGE_MAP[language.toLowerCase()];
-  if (!languageId) {
-    return res.status(400).json({ success: false, error: `Unsupported language: ${language}` });
-  }
-
-  try {
-    // Step 1: Submit the code
-    const submitRes = await axios.post(
-      `${JUDGE0_URL}/submissions?base64_encoded=false&wait=false`,
-      {
-        language_id: languageId,
-        source_code: code,
-        stdin: stdin || "",
-        cpu_time_limit: 5,
-        wall_time_limit: 10,
-      },
-      { timeout: 15000 }
-    );
-
-    const token = submitRes.data.token;
-    if (!token) {
-      return res.status(500).json({ success: false, error: "Failed to submit code to execution service." });
-    }
-
-    // Step 2: Poll for result (max ~10 seconds)
-    let result: any = null;
-    for (let i = 0; i < 20; i++) {
-      await new Promise((r) => setTimeout(r, 500));
-      const pollRes = await axios.get(
-        `${JUDGE0_URL}/submissions/${token}?base64_encoded=false`,
-        { timeout: 10000 }
-      );
-      result = pollRes.data;
-      // Status IDs 1 and 2 mean "In Queue" / "Processing"
-      if (result.status?.id > 2) break;
-    }
-
-    if (!result) {
-      return res.status(500).json({ success: false, error: "Execution timed out." });
-    }
-
-    const statusId = result.status?.id;
-    const stdout = result.stdout || "";
-    const stderr = result.stderr || "";
-    const compileOutput = result.compile_output || "";
-
-    // Status IDs: 3=Accepted, 4=WrongAnswer, 5=TLE, 6=CompileError, etc.
-    if (statusId === 6) {
-      // Compile Error
-      return res.json({ success: false, output: "", error: compileOutput, type: "compile_error" });
-    }
-
-    if (statusId === 5) {
-      return res.json({ success: false, output: stdout, error: "Time Limit Exceeded (5 seconds)", type: "tle" });
-    }
-
-    const isSuccess = statusId === 3;
-    return res.json({
-      success: isSuccess,
-      output: stdout,
-      error: stderr || (isSuccess ? "" : (result.status?.description || "Runtime Error")),
-      type: isSuccess ? "success" : "runtime_error",
-      exitCode: result.exit_code,
-    });
-  } catch (err: any) {
-    console.error("Judge0 error:", err?.response?.data || err.message);
-    return res.status(500).json({
-      success: false,
-      output: "",
-      error: "Execution service unavailable. Please try again.",
-      type: "server_error",
-    });
-  }
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
+const IS_WIN = os.platform() === "win32";
+const MINGW = "C:\\mingw64\\bin";
+
+function getEnv() {
+  if (IS_WIN) {
+    return { ...process.env, PATH: `${MINGW};${process.env.PATH}` };
+  }
+  return { ...process.env };
+}
+
+function compile(cmd: string, args: string[]): Promise<{ error?: string }> {
+  return new Promise((resolve) => {
+    const p = spawn(cmd, args, { env: getEnv() });
+    let stderr = "";
+    p.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+    p.on("exit", (code) => {
+      if (code !== 0) resolve({ error: stderr || "Compilation failed." });
+      else resolve({});
+    });
+    p.on("error", (err) => resolve({ error: err.message }));
+  });
+}
+
+// ── Socket.IO: interactive code execution ────────────────────────────────────
+io.on("connection", (socket) => {
+  let proc: ReturnType<typeof spawn> | null = null;
+  let tempDir: string | null = null;
+
+  const cleanup = () => {
+    if (proc) { try { proc.kill(); } catch (_) {} proc = null; }
+    if (tempDir) { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {} tempDir = null; }
+  };
+
+  socket.on("execute", async ({ code, language, fileName }: any) => {
+    cleanup(); // kill any previous session
+
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nova-"));
+    const lang = (language || "").toLowerCase();
+
+    try {
+      let runCmd: string;
+      let runArgs: string[];
+
+      if (lang === "python" || lang === "py") {
+        const src = path.join(tempDir, "main.py");
+        fs.writeFileSync(src, code);
+        runCmd = IS_WIN ? "python" : "python3";
+        runArgs = ["-u", src];
+
+      } else if (lang === "javascript" || lang === "js") {
+        const src = path.join(tempDir, "main.js");
+        fs.writeFileSync(src, code);
+        runCmd = "node";
+        runArgs = [src];
+
+      } else if (lang === "c") {
+        const src = path.join(tempDir, "main.c");
+        const out = path.join(tempDir, IS_WIN ? "prog.exe" : "prog");
+        fs.writeFileSync(src, code);
+        socket.emit("output", "\x1b[90mCompiling…\x1b[0m\r\n");
+        const cc = IS_WIN ? path.join(MINGW, "gcc") : "gcc";
+        const result = await compile(cc, [src, "-o", out, "-lm"]);
+        if (result.error) {
+          socket.emit("output", "\x1b[31m" + result.error.replace(/\n/g, "\r\n") + "\x1b[0m\r\n");
+          socket.emit("execution_finished", { exitCode: 1 });
+          return;
+        }
+        runCmd = out; runArgs = [];
+
+      } else if (lang === "cpp" || lang === "c++") {
+        const src = path.join(tempDir, "main.cpp");
+        const out = path.join(tempDir, IS_WIN ? "prog.exe" : "prog");
+        fs.writeFileSync(src, code);
+        socket.emit("output", "\x1b[90mCompiling…\x1b[0m\r\n");
+        const cxx = IS_WIN ? path.join(MINGW, "g++") : "g++";
+        const result = await compile(cxx, [src, "-o", out, "-lm"]);
+        if (result.error) {
+          socket.emit("output", "\x1b[31m" + result.error.replace(/\n/g, "\r\n") + "\x1b[0m\r\n");
+          socket.emit("execution_finished", { exitCode: 1 });
+          return;
+        }
+        runCmd = out; runArgs = [];
+
+      } else {
+        socket.emit("output", `\x1b[31mUnsupported language: ${language}\x1b[0m\r\n`);
+        socket.emit("execution_finished", { exitCode: 1 });
+        return;
+      }
+
+      proc = spawn(runCmd, runArgs, { env: getEnv(), cwd: tempDir });
+
+      proc.stdout?.on("data", (d: Buffer) => {
+        socket.emit("output", d.toString().replace(/\n/g, "\r\n"));
+      });
+      proc.stderr?.on("data", (d: Buffer) => {
+        socket.emit("output", "\x1b[31m" + d.toString().replace(/\n/g, "\r\n") + "\x1b[0m");
+      });
+      proc.on("exit", (code) => {
+        socket.emit("output", `\r\n\x1b[90m──────────────────────────────\r\nProcess exited with code ${code ?? 0}\x1b[0m\r\n`);
+        socket.emit("execution_finished", { exitCode: code });
+        proc = null;
+        cleanup();
+      });
+      proc.on("error", (err) => {
+        socket.emit("output", `\x1b[31mFailed to start: ${err.message}\x1b[0m\r\n`);
+        socket.emit("execution_finished", { exitCode: 1 });
+        proc = null;
+        cleanup();
+      });
+
+      // 5-minute safety timeout
+      setTimeout(() => {
+        if (proc) {
+          socket.emit("output", "\r\n\x1b[31mTimeout: process killed after 5 minutes.\x1b[0m\r\n");
+          socket.emit("execution_finished", { exitCode: -1 });
+          cleanup();
+        }
+      }, 300_000);
+
+    } catch (e: any) {
+      socket.emit("output", `\x1b[31mError: ${e.message}\x1b[0m\r\n`);
+      socket.emit("execution_finished", { exitCode: 1 });
+      cleanup();
+    }
+  });
+
+  // Forward keystrokes from terminal directly to the process stdin
+  socket.on("stdin", (data: string) => {
+    if (proc?.stdin && !proc.stdin.destroyed) {
+      proc.stdin.write(data);
+    }
+  });
+
+  socket.on("kill", () => {
+    if (proc) {
+      proc.kill("SIGINT");
+    }
+  });
+
+  socket.on("disconnect", cleanup);
+});
+
+// ── Express app ───────────────────────────────────────────────────────────────
 async function startServer() {
   const PORT = process.env.PORT || 3000;
 
@@ -119,12 +173,12 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req: any, res: any) => {
+    app.get("*", (_req: any, res: any) => {
       res.sendFile(path.join(__dirname, "dist", "index.html"));
     });
   }
 
-  app.listen(PORT, () => {
+  httpServer.listen(PORT, () => {
     console.log(`Nova IDE running on http://localhost:${PORT}`);
   });
 }
