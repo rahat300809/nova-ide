@@ -87,9 +87,12 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
     term.writeln('\x1b[90m  Press \x1b[32mRun ▶\x1b[90m to execute. Supports real-time input.\x1b[0m');
     term.writeln('');
 
-    // Connect socket to the same origin (works on any port, local or deployed)
+    // In dev: Socket.IO runs on port 3001 (separate from Vite on 3000).
+    // In prod: everything is on the same origin/port (Render).
     const backendUrl = import.meta.env.VITE_BACKEND_URL ||
-      (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000');
+      (import.meta.env.PROD
+        ? window.location.origin
+        : 'http://localhost:3001');
     const socket = socketIO(backendUrl, { transports: ['websocket', 'polling'] });
     socketRef.current = socket;
 
@@ -106,28 +109,28 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
       setIsRunning(false);
     });
 
-    // Forward every keystroke to process stdin in real-time
+    // Forward every keystroke to process stdin — node-pty echoes it back via 'output'
     term.onData((data) => {
       if (socketRef.current?.connected) {
         // Ctrl+C → send SIGINT
         if (data === '\x03') {
           socketRef.current.emit('kill');
-          term.writeln('^C');
           return;
         }
         socketRef.current.emit('stdin', data);
-        // Echo printable chars and handle backspace locally for UX
-        if (data === '\r') {
-          term.write('\r\n');
-        } else if (data === '\x7f' || data === '\b') {
-          term.write('\b \b');
-        } else if (data >= ' ') {
-          term.write(data);
-        }
+        // No local echo needed: node-pty echoes the character back through proc.onData → 'output'
       }
     });
 
-    const ro = new ResizeObserver(() => { try { fit.fit(); } catch(e){} });
+    const ro = new ResizeObserver(() => {
+      try {
+        fit.fit();
+        // Forward new size to the PTY on server so it tracks cols/rows
+        if (socket.connected) {
+          socket.emit('resize', { cols: term.cols, rows: term.rows });
+        }
+      } catch(e) {}
+    });
     ro.observe(terminalRef.current);
     return () => { ro.disconnect(); term.dispose(); socket.disconnect(); };
   }, []);
@@ -541,7 +544,12 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
                 {isRunning && <span className="text-[#d7ba7d] animate-pulse ml-2">● Running</span>}
               </div>
               <button
-                onClick={() => { xtermRef.current?.clear(); xtermRef.current?.writeln('\x1b[90mTerminal cleared.\x1b[0m'); }}
+                onClick={() => {
+                  xtermRef.current?.clear();
+                  xtermRef.current?.writeln('\x1b[90mTerminal cleared.\x1b[0m');
+                  // Re-focus so keystrokes still go to stdin if code is running
+                  xtermRef.current?.focus();
+                }}
                 className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-300 px-2 py-1 rounded hover:bg-white/10 transition-colors"
               >
                 <Trash2 size={11} /> Clear
