@@ -160,10 +160,22 @@ async function startServer() {
       server: { middlewareMode: true },
       appType: "spa",
     });
-    app.use(vite.middlewares);
+
+    // Bypass Vite's SPA fallback for socket.io requests
+    app.use((req, res, next) => {
+      if (req.url.startsWith('/socket.io')) {
+        return; // Halt Express, let Engine.IO handle it
+      }
+      vite.middlewares(req, res, next);
+    });
   } else {
     app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req, res) => {
+    
+    // Bypass SPA fallback for socket.io requests in production
+    app.get("*", (req, res, next) => {
+      if (req.url.startsWith('/socket.io')) {
+        return; 
+      }
       res.sendFile(path.join(__dirname, "dist", "index.html"));
     });
   }

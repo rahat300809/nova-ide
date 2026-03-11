@@ -89,7 +89,7 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
     resizeObserver.observe(terminalRef.current);
 
     // Initialize Socket.io
-    const backendUrl = import.meta.env.VITE_BACKEND_URL || (import.meta.env.PROD ? 'https://nova-ide.onrender.com' : '');
+    const backendUrl = import.meta.env.VITE_BACKEND_URL || (import.meta.env.PROD ? 'https://nova-ide.onrender.com' : 'http://localhost:3000');
     const socket = io(backendUrl);
     socketRef.current = socket;
 
