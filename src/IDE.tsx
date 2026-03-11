@@ -32,6 +32,12 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
   const xtermRef = useRef<XTerm | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<Socket | null>(null);
+
+  // Resizable terminal
+  const [terminalHeight, setTerminalHeight] = useState(280);
+  const isDraggingRef = useRef(false);
+  const dragStartYRef = useRef(0);
+  const dragStartHRef = useRef(0);
   
   // Custom Modal State
   const [createModal, setCreateModal] = useState<{ isOpen: boolean; type: 'file' | 'folder'; parentId: string | null }>({
@@ -61,6 +67,7 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
     if (!terminalRef.current) return;
 
     const term = new XTerm({
+      scrollback: 5000,
       cursorBlink: true,
       fontFamily: '"JetBrains Mono", "Fira Code", Consolas, monospace',
       fontSize: 13,
@@ -535,27 +542,63 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
             )}
           </div>
 
-          {/* Unified VS Code-style Terminal */}
-          <div className="h-[35%] min-h-[180px] border-t border-[#333] flex flex-col" style={{background:'#1e1e1e'}}>
-            <div className="flex items-center justify-between px-4 py-1.5 bg-[#252526] border-b border-[#111]">
+          {/* Unified VS Code-style Terminal — drag the top bar to resize */}
+          <div
+            className="flex flex-col border-t border-[#333]"
+            style={{ height: terminalHeight, minHeight: 120, background: '#1e1e1e' }}
+          >
+            {/* ── Drag handle ── */}
+            <div
+              className="flex items-center justify-between px-4 bg-[#252526] border-b border-[#111] select-none"
+              style={{ cursor: 'ns-resize', paddingTop: 3, paddingBottom: 3 }}
+              onMouseDown={(e) => {
+                isDraggingRef.current = true;
+                dragStartYRef.current = e.clientY;
+                dragStartHRef.current = terminalHeight;
+                const onMove = (ev: MouseEvent) => {
+                  if (!isDraggingRef.current) return;
+                  const delta = dragStartYRef.current - ev.clientY;
+                  const next = Math.max(120, Math.min(window.innerHeight * 0.85, dragStartHRef.current + delta));
+                  setTerminalHeight(next);
+                  try { fitAddonRef.current?.fit(); } catch (_) {}
+                };
+                const onUp = () => {
+                  isDraggingRef.current = false;
+                  window.removeEventListener('mousemove', onMove);
+                  window.removeEventListener('mouseup', onUp);
+                  try { fitAddonRef.current?.fit(); } catch (_) {}
+                };
+                window.addEventListener('mousemove', onMove);
+                window.addEventListener('mouseup', onUp);
+              }}
+            >
+              {/* grip dots */}
               <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-[#9cdcfe]">
                 <Terminal size={13} />
                 <span>Terminal</span>
                 {isRunning && <span className="text-[#d7ba7d] animate-pulse ml-2">● Running</span>}
               </div>
-              <button
-                onClick={() => {
-                  xtermRef.current?.clear();
-                  xtermRef.current?.writeln('\x1b[90mTerminal cleared.\x1b[0m');
-                  // Re-focus so keystrokes still go to stdin if code is running
-                  xtermRef.current?.focus();
-                }}
-                className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-300 px-2 py-1 rounded hover:bg-white/10 transition-colors"
-              >
-                <Trash2 size={11} /> Clear
-              </button>
+              <div className="flex items-center gap-3">
+                <span className="text-[#555] text-xs tracking-[3px]">· · ·</span>
+                <button
+                  onClick={() => {
+                    // Kill any running process so Run button resets
+                    if (isRunning) {
+                      socketRef.current?.emit('kill');
+                      setIsRunning(false);
+                    }
+                    xtermRef.current?.clear();
+                    xtermRef.current?.writeln('\x1b[90mTerminal cleared. Ready for new run.\x1b[0m');
+                    xtermRef.current?.focus();
+                  }}
+                  className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-300 px-2 py-1 rounded hover:bg-white/10 transition-colors"
+                  onMouseDown={(e) => e.stopPropagation()}
+                >
+                  <Trash2 size={11} /> Clear
+                </button>
+              </div>
             </div>
-            <div ref={terminalRef} className="flex-1" />
+            <div ref={terminalRef} className="flex-1 overflow-hidden" />
           </div>
         </main>
       </div>
