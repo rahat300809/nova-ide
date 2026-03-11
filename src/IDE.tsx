@@ -1,0 +1,418 @@
+import React, { useState, useEffect, useRef } from 'react';
+import Editor from '@monaco-editor/react';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  FolderPlus, FilePlus, Play, Save, Trash2, ChevronRight, 
+  ChevronDown, FileCode, Folder, Search, Download, LogOut,
+  Terminal, X, FileText, Menu, Settings, Columns, Code2
+} from 'lucide-react';
+import { Button } from './components/Button';
+import { FileNode } from './App';
+import JSZip from 'jszip';
+import { jsPDF } from 'jspdf';
+import { cn } from './components/Button';
+import { doc, setDoc, deleteDoc, updateDoc, collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { db } from './firebase';
+
+export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, openTabs, setOpenTabs, expandedFolders, setExpandedFolders, onBackToDashboard, onLogout }: any) {
+  
+  const [output, setOutput] = useState('');
+  const [isRunning, setIsRunning] = useState(false);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+
+  // Auto language detection logic.
+  const getLanguageFromExtension = (name: string) => {
+    const ext = name.split('.').pop()?.toLowerCase();
+    if (ext === 'py') return 'python';
+    if (ext === 'c') return 'c';
+    if (ext === 'cpp') return 'cpp';
+    if (ext === 'js') return 'javascript';
+    if (ext === 'html') return 'html';
+    if (ext === 'css') return 'css';
+    if (ext === 'json') return 'json';
+    return 'plaintext';
+  };
+
+  const createFile = async (type: 'file' | 'folder', parentId: string | null = null) => {
+    const name = prompt(`Enter ${type} name:`);
+    if (!name) return;
+
+    const language = type === 'file' ? getLanguageFromExtension(name) : undefined;
+    
+    // Optimistic UI update
+    const tempId = Math.random().toString(36).substr(2, 9);
+    const newFileNode: FileNode = {
+      id: tempId,
+      name,
+      type,
+      parentId,
+      content: '',
+      language
+    };
+    setFiles([...files, newFileNode]);
+    
+    // Backend DB update
+    const docRef = await addDoc(collection(db, 'files'), {
+      userId: user.uid,
+      name,
+      type,
+      parentId,
+      content: '',
+      language,
+      createdAt: serverTimestamp()
+    });
+
+    // Update state with confirmed ID
+    setFiles((prev: any) => prev.map((f: any) => f.id === tempId ? { ...f, id: docRef.id } : f));
+    
+    if (type === 'file') {
+      setActiveFileId(docRef.id);
+      if (!openTabs.includes(docRef.id)) setOpenTabs([...openTabs, docRef.id]);
+    } else {
+      setExpandedFolders(new Set(expandedFolders).add(docRef.id));
+    }
+  };
+
+  const deleteFile = async (id: string) => {
+    if (!confirm('Are you sure you want to delete this?')) return;
+    
+    // DB
+    await deleteDoc(doc(db, 'files', id));
+    
+    // State
+    setFiles(files.filter((f: any) => f.id !== id && f.parentId !== id)); // note: shallow delete in state
+    setOpenTabs(openTabs.filter((tid: any) => tid !== id));
+    if (activeFileId === id) setActiveFileId(null);
+  };
+
+  const updateFileContent = async (id: string, content: string) => {
+    setFiles(files.map((f: any) => f.id === id ? { ...f, content } : f));
+    setIsSaving(true);
+    try {
+      await updateDoc(doc(db, 'files', id), { content });
+    } finally {
+      setTimeout(() => setIsSaving(false), 500);
+    }
+  };
+
+  const runCode = async () => {
+    const activeFile = files.find((f: any) => f.id === activeFileId);
+    if (!activeFile || activeFile.type !== 'file') return;
+
+    setIsRunning(true);
+    setOutput('Running...');
+    try {
+      const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
+      const res = await fetch(`${backendUrl}/api/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: activeFile.content,
+          language: activeFile.language,
+          fileName: activeFile.name
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+         setOutput(data.stdout + (data.stderr ? `\nERROR:\n${data.stderr}` : ''));
+      } else {
+         setOutput(`Sandbox Error: ${data.error}`);
+      }
+    } catch (e) {
+      setOutput('Failed to communicate with execution server.\nPlease check your connection.');
+    } finally {
+      setIsRunning(false);
+    }
+  };
+
+  const downloadFile = (file: FileNode) => {
+    const blob = new Blob([file.content || ''], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = file.name;
+    a.click();
+  };
+
+  const exportPDF = (file: FileNode) => {
+    const doc = new jsPDF();
+    doc.setFontSize(12);
+    // Split text to handle multiple lines in PDF
+    const splitText = doc.splitTextToSize(file.content || '', 180);
+    doc.text(splitText, 10, 10);
+    doc.save(`${file.name}.pdf`);
+  };
+
+  const downloadProject = async () => {
+    const zip = new JSZip();
+    const buildZip = (parentId: string | null, folder: any) => {
+      const children = files.filter((f: any) => f.parentId === parentId);
+      children.forEach((child: any) => {
+        if (child.type === 'file') {
+          folder.file(child.name, child.content || '');
+        } else {
+          const subFolder = folder.folder(child.name);
+          buildZip(child.id, subFolder);
+        }
+      });
+    };
+    buildZip(null, zip);
+    const content = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(content);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'codelab_project.zip';
+    a.click();
+  };
+
+  const renderTree = (parentId: string | null = null, depth = 0) => {
+    return files
+      .filter((f: any) => f.parentId === parentId)
+      .sort((a: any, b: any) => (a.type === 'folder' ? -1 : 1))
+      .map((node: any) => {
+        const isExpanded = expandedFolders.has(node.id);
+        const isActive = activeFileId === node.id;
+
+        return (
+          <div key={node.id}>
+            <div 
+              className={cn(
+                "group flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer transition-colors duration-200",
+                isActive ? "bg-blue-100/80 text-blue-700" : "hover:bg-slate-200/50 text-slate-700"
+              )}
+              style={{ paddingLeft: `${depth * 14 + 10}px` }}
+              onClick={() => {
+                if (node.type === 'folder') {
+                  const next = new Set(expandedFolders);
+                  if (isExpanded) next.delete(node.id);
+                  else next.add(node.id);
+                  setExpandedFolders(next);
+                } else {
+                  setActiveFileId(node.id);
+                  if (!openTabs.includes(node.id)) setOpenTabs([...openTabs, node.id]);
+                }
+              }}
+            >
+              {node.type === 'folder' ? (
+                isExpanded ? <ChevronDown size={14} className="text-slate-400" /> : <ChevronRight size={14} className="text-slate-400" />
+              ) : <div className="w-3.5" />}
+              
+              {node.type === 'folder' ? 
+                <Folder size={16} className="text-amber-500 flex-shrink-0 fill-amber-500/20" /> : 
+                <FileCode size={16} className="text-blue-500 flex-shrink-0" />
+              }
+              <span className="text-sm flex-1 truncate">{node.name}</span>
+              
+              <div className="hidden group-hover:flex items-center gap-0.5 ml-auto">
+                {node.type === 'folder' && (
+                  <>
+                    <button onClick={(e) => { e.stopPropagation(); createFile('file', node.id); }} className="p-1 hover:bg-slate-300/50 rounded text-slate-500 hover:text-blue-600"><FilePlus size={12} /></button>
+                    <button onClick={(e) => { e.stopPropagation(); createFile('folder', node.id); }} className="p-1 hover:bg-slate-300/50 rounded text-slate-500 hover:text-blue-600"><FolderPlus size={12} /></button>
+                  </>
+                )}
+                <button onClick={(e) => { e.stopPropagation(); deleteFile(node.id); }} className="p-1 hover:bg-red-100 rounded text-red-400 hover:text-red-600"><Trash2 size={12} /></button>
+              </div>
+            </div>
+            {node.type === 'folder' && isExpanded && renderTree(node.id, depth + 1)}
+          </div>
+        );
+      });
+  };
+
+  return (
+    <div className="flex-1 flex flex-col h-screen overflow-hidden bg-[var(--color-base-bg)]">
+      
+      {/* App Header Bar */}
+      <header className="h-12 glass z-20 flex items-center justify-between px-4 border-b border-white/40 shadow-[var(--shadow-soft)]">
+        <div className="flex items-center gap-4">
+          <button onClick={onBackToDashboard} className="flex items-center gap-2 text-slate-600 hover:text-blue-600 transition-colors font-medium">
+            <div className="w-7 h-7 bg-blue-600 rounded-md flex items-center justify-center shadow-lg shadow-blue-500/20">
+              <FileCode className="text-white" size={14} />
+            </div>
+            <span>Dashboard</span>
+          </button>
+          
+          <div className="h-4 w-px bg-slate-300" />
+          
+          <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-1.5 text-slate-500 hover:bg-slate-200/50 rounded-md transition-colors">
+            <Columns size={16} />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-3">
+          {isSaving && (
+            <div className="flex items-center gap-1.5 text-xs font-medium text-slate-500 animate-pulse bg-white/50 px-2 py-1 rounded-md">
+              <Save size={12} /> Saving...
+            </div>
+          )}
+          
+          <Button 
+            onClick={downloadProject} 
+            variant="ghost" 
+            title="Download Full Project"
+            className="hidden sm:flex"
+          >
+            <Download size={14} /> Project
+          </Button>
+
+          <Button 
+            onClick={runCode} 
+            disabled={isRunning || !activeFileId || files.find((f:FileNode) => f.id === activeFileId)?.type !== 'file'} 
+            variant="success"
+            className="px-5 shadow-emerald-500/30 font-semibold"
+          >
+            {isRunning ? <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent" /> : <Play size={16} fill="currentColor" />}
+            Run
+          </Button>
+        </div>
+      </header>
+
+      {/* Main IDE Area */}
+      <div className="flex-1 flex overflow-hidden relative">
+        <AnimatePresence mode="wait">
+          {isSidebarOpen && (
+            <motion.aside 
+              initial={{ width: 0, opacity: 0 }}
+              animate={{ width: 260, opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }}
+              className="glass-panel z-10 border-r border-white/40 flex flex-col shadow-[var(--shadow-soft)] relative"
+            >
+              <div className="p-4 space-y-4">
+                <div className="relative group">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-blue-500 transition-colors" size={14} />
+                  <input 
+                    type="text" 
+                    placeholder="Search files..."
+                    className="w-full pl-9 pr-3 py-1.5 bg-white/60 border border-slate-200/60 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400 placeholder-slate-400 backdrop-blur-sm"
+                    value={searchTerm}
+                    onChange={e => setSearchTerm(e.target.value)}
+                  />
+                </div>
+                
+                <div className="flex items-center justify-between text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                  <span>Explorer</span>
+                  <div className="flex gap-1">
+                    <button onClick={() => createFile('file')} className="p-1 hover:bg-slate-200/50 rounded-md text-slate-600" title="New File"><FilePlus size={14} /></button>
+                    <button onClick={() => createFile('folder')} className="p-1 hover:bg-slate-200/50 rounded-md text-slate-600" title="New Folder"><FolderPlus size={14} /></button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto px-2 pb-4 scrollbar-hide">
+                {renderTree()}
+              </div>
+            </motion.aside>
+          )}
+        </AnimatePresence>
+
+        <main className="flex-1 flex flex-col min-w-0 bg-white shadow-[-10px_0_30px_rgba(0,0,0,0.02)] z-0">
+          {/* Tabs */}
+          <div className="h-10 bg-slate-50 border-b border-slate-200 flex items-center overflow-x-auto scrollbar-hide">
+            {openTabs.map((tabId: string) => {
+              const file = files.find((f: any) => f.id === tabId);
+              if (!file) return null;
+              const isActive = activeFileId === tabId;
+              return (
+                <div 
+                  key={tabId}
+                  className={cn(
+                    "flex-shrink-0 h-full flex items-center gap-2 px-4 border-r border-slate-200 cursor-pointer transition-colors max-w-[200px] select-none",
+                    isActive ? "bg-white border-t-[3px] border-t-blue-500 text-slate-900" : "bg-slate-100 hover:bg-slate-50 border-t-[3px] border-t-transparent text-slate-500"
+                  )}
+                  onClick={() => setActiveFileId(tabId)}
+                >
+                  <FileCode size={14} className={isActive ? "text-blue-500" : "text-slate-400"} />
+                  <span className="text-sm truncate font-medium">{file.name}</span>
+                  <button 
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setOpenTabs(openTabs.filter((id: string) => id !== tabId));
+                      if (activeFileId === tabId) setActiveFileId(openTabs[openTabs.indexOf(tabId) - 1] || openTabs[openTabs.indexOf(tabId) + 1] || null);
+                    }}
+                    className="p-1 hover:bg-slate-200 rounded-md text-slate-400 hover:text-slate-700 transition-colors ml-1"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Editor Area */}
+          <div className="flex-1 relative bg-white">
+            {activeFileId && files.find((f:any) => f.id === activeFileId) ? (
+              <Editor
+                height="100%"
+                language={files.find((f:any) => f.id === activeFileId)?.language || 'plaintext'}
+                value={files.find((f:any) => f.id === activeFileId)?.content || ''}
+                theme="light"
+                onChange={(val) => updateFileContent(activeFileId, val || '')}
+                options={{
+                  fontSize: 14,
+                  fontFamily: 'JetBrains Mono',
+                  minimap: { enabled: false },
+                  scrollBeyondLastLine: false,
+                  automaticLayout: true,
+                  padding: { top: 16 },
+                  lineNumbers: 'on',
+                  roundedSelection: true,
+                  cursorStyle: 'line',
+                  cursorBlinking: 'smooth',
+                  smoothScrolling: true,
+                  scrollbar: {
+                    verticalScrollbarSize: 8,
+                    horizontalScrollbarSize: 8,
+                  }
+                }}
+              />
+            ) : (
+              <div className="h-full flex flex-col items-center justify-center text-slate-400 bg-slate-50/50">
+                <div className="w-24 h-24 bg-white shadow-sm border border-slate-100 rounded-[2rem] flex items-center justify-center mb-6">
+                  <Code2 size={40} className="text-slate-300" />
+                </div>
+                <p className="text-lg font-medium text-slate-600">Select a file to start coding</p>
+                <div className="flex gap-3 mt-6">
+                  <Button variant="secondary" onClick={() => createFile('file')} className="bg-white border-slate-200">New File</Button>
+                  {!isSidebarOpen && <Button variant="secondary" onClick={() => setIsSidebarOpen(true)}>Open Explorer</Button>}
+                </div>
+              </div>
+            )}
+
+            {/* Floating File Actions */}
+            {activeFileId && files.find((f:any) => f.id === activeFileId) && (
+              <div className="absolute top-4 right-6 flex gap-2 z-10">
+                <Button variant="secondary" onClick={() => downloadFile(files.find((f:any) => f.id === activeFileId)!)} title="Download File" className="backdrop-blur-md bg-white/80 p-2 shadow-sm"><Download size={16} className="text-slate-600"/></Button>
+                <Button variant="secondary" onClick={() => exportPDF(files.find((f:any) => f.id === activeFileId)!)} title="Export PDF" className="backdrop-blur-md bg-white/80 p-2 shadow-sm"><FileText size={16} className="text-slate-600" /></Button>
+              </div>
+            )}
+          </div>
+
+          {/* Bottom Terminal Panel */}
+          <div className="h-[30%] min-h-[150px] border-t border-slate-200 flex flex-col bg-[#1e1e1e] text-slate-300 relative z-10">
+            <div className="h-10 bg-[#2d2d2d] px-4 flex items-center justify-between border-b border-[#1e1e1e]">
+              <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-[#9cdcfe]">
+                <Terminal size={14} />
+                Console
+              </div>
+              <button onClick={() => setOutput('')} className="p-1.5 hover:bg-white/10 rounded flex items-center gap-2 text-xs transition-colors" title="Clear Console">
+                <Trash2 size={12} className="text-slate-400" />
+                Clear
+              </button>
+            </div>
+            <div className="flex-1 p-4 font-mono text-sm overflow-y-auto whitespace-pre-wrap selection:bg-blue-500/30">
+              {output ? (
+                <div className={output.includes('ERROR:') ? 'text-red-400' : 'text-slate-300'}>
+                  {output}
+                </div>
+              ) : (
+                <div className="text-slate-600 select-none">No output yet. Run your code to see results here.</div>
+              )}
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
