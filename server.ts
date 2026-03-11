@@ -16,7 +16,7 @@ app.use(cors());
 
 // --- Code Execution Sandbox API ---
 app.post("/api/run", async (req: any, res: any) => {
-  const { code, language, fileName } = req.body;
+  const { code, language, fileName, input } = req.body;
   
   // Create a unique temporary directory for this execution
   const executionId = Math.random().toString(36).substring(2, 15);
@@ -28,20 +28,24 @@ app.post("/api/run", async (req: any, res: any) => {
   const filePath = path.join(tempDir, safeFileName);
   fs.writeFileSync(filePath, code);
 
+  // Write stdin content if provided
+  const inputPath = path.join(tempDir, 'input.txt');
+  fs.writeFileSync(inputPath, input || '');
+
   let command = "";
+  const inputRedirect = `< ${inputPath}`;
   
   try {
     if (language === "python" || language === "py") {
-      command = `python3 -c "${code.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`; // execute carefully or just use python filePath
-      command = `python3 ${filePath}`; 
+      command = `python3 ${filePath} ${inputRedirect}`; 
     } else if (language === "c") {
       const outPath = path.join(tempDir, "output.exe");
-      command = `gcc ${filePath} -o ${outPath} && ${outPath}`;
+      command = `gcc ${filePath} -o ${outPath} && ${outPath} ${inputRedirect}`;
     } else if (language === "cpp" || language === "c++") {
       const outPath = path.join(tempDir, "output.exe");
-      command = `g++ ${filePath} -o ${outPath} && ${outPath}`;
+      command = `g++ ${filePath} -o ${outPath} && ${outPath} ${inputRedirect}`;
     } else if (language === "javascript" || language === "js") {
-      command = `node ${filePath}`;
+      command = `node ${filePath} ${inputRedirect}`;
     } else {
       return res.status(400).json({ error: `Unsupported language: ${language}` });
     }

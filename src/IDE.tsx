@@ -21,6 +21,8 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
   const [searchTerm, setSearchTerm] = useState('');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [inputValue, setInputValue] = useState('');
+  const [consoleTab, setConsoleTab] = useState<'output' | 'input'>('output');
   
   // Custom Modal State
   const [createModal, setCreateModal] = useState<{ isOpen: boolean; type: 'file' | 'folder'; parentId: string | null }>({
@@ -75,15 +77,19 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
     
     // Backend DB update
     try {
-      const docRef = await addDoc(collection(db, 'files'), {
+      const payload: any = {
         userId: user.uid,
         name,
         type,
         parentId,
         content: '',
-        language,
         createdAt: serverTimestamp()
-      });
+      };
+      if (language !== undefined) {
+        payload.language = language;
+      }
+
+      const docRef = await addDoc(collection(db, 'files'), payload);
 
       // Update state with confirmed ID
       setFiles((prev: any) => prev.map((f: any) => f.id === tempId ? { ...f, id: docRef.id } : f));
@@ -123,26 +129,30 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
   };
 
   const updateFileContent = (id: string, content: string) => {
-    // 1. Immediately update local state functionally so it doesn't rely on stale `files`
+    // 1. LocalStorage immediate draft backup
+    try { localStorage.setItem(`nova_draft_${id}`, content); } catch(e) {}
+
+    // 2. Immediately update local state functionally so it doesn't rely on stale `files`
     setFiles((prev: any) => prev.map((f: any) => f.id === id ? { ...f, content } : f));
     
-    // 2. Clear any pending save
+    // 3. Clear any pending save
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     
-    // 3. Debounce the Firestore write
+    // 4. Debounce the Firestore write (aggressive for auto-save)
     setIsSaving(true);
     saveTimeoutRef.current = setTimeout(async () => {
       try {
         // Double check it's not a tempId
         if (!id.startsWith('temp_')) {
           await updateDoc(doc(db, 'files', id), { content });
+          localStorage.removeItem(`nova_draft_${id}`);
         }
       } catch (e) {
         console.error("Error saving file", e);
       } finally {
         setIsSaving(false);
       }
-    }, 1000);
+    }, 500); // 500ms debounce
   };
 
   const runCode = async () => {
@@ -159,10 +169,12 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
         body: JSON.stringify({
           code: activeFile.content,
           language: activeFile.language,
-          fileName: activeFile.name
+          fileName: activeFile.name,
+          input: inputValue
         }),
       });
       const data = await res.json();
+      setConsoleTab('output'); // auto-switch to output when done
       if (res.ok) {
          setOutput(data.stdout + (data.stderr ? `\nERROR:\n${data.stderr}` : ''));
       } else {
@@ -394,7 +406,11 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
               <Editor
                 height="100%"
                 language={files.find((f:any) => f.id === activeFileId)?.language || 'plaintext'}
-                value={files.find((f:any) => f.id === activeFileId)?.content || ''}
+                // Use defaultLanguage and defaultValue to mount Monaco ONCE per file 
+                // and let Monaco handle its own internal state/undo stack.
+                // We use `path` to force a new Monaco model when activeFileId changes
+                path={activeFileId}
+                defaultValue={files.find((f:any) => f.id === activeFileId)?.content || ''}
                 theme="light"
                 onChange={(val) => updateFileContent(activeFileId, val || '')}
                 options={{
@@ -440,22 +456,47 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
           {/* Bottom Terminal Panel */}
           <div className="h-[30%] min-h-[150px] border-t border-slate-200 flex flex-col bg-[#1e1e1e] text-slate-300 relative z-10">
             <div className="h-10 bg-[#2d2d2d] px-4 flex items-center justify-between border-b border-[#1e1e1e]">
-              <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-[#9cdcfe]">
-                <Terminal size={14} />
-                Console
+              <div className="flex items-center gap-6">
+                <button 
+                  onClick={() => setConsoleTab('output')}
+                  className={cn("flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest pb-2.5 pt-3 transition-colors border-b-2", consoleTab === 'output' ? "text-[#9cdcfe] border-[#9cdcfe]" : "text-slate-500 border-transparent hover:text-slate-300")}
+                >
+                  <Terminal size={14} />
+                  Output
+                </button>
+                <button 
+                  onClick={() => setConsoleTab('input')}
+                  className={cn("flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest pb-2.5 pt-3 transition-colors border-b-2", consoleTab === 'input' ? "text-[#ce9178] border-[#ce9178]" : "text-slate-500 border-transparent hover:text-slate-300")}
+                >
+                  <FileText size={14} />
+                  Stdin (Input)
+                </button>
               </div>
+              
               <button onClick={() => setOutput('')} className="p-1.5 hover:bg-white/10 rounded flex items-center gap-2 text-xs transition-colors" title="Clear Console">
                 <Trash2 size={12} className="text-slate-400" />
                 Clear
               </button>
             </div>
-            <div className="flex-1 p-4 font-mono text-sm overflow-y-auto whitespace-pre-wrap selection:bg-blue-500/30">
-              {output ? (
-                <div className={output.includes('ERROR:') ? 'text-red-400' : 'text-slate-300'}>
-                  {output}
+            <div className="flex-1 overflow-hidden relative">
+              {consoleTab === 'output' ? (
+                <div className="absolute inset-0 p-4 font-mono text-sm overflow-y-auto whitespace-pre-wrap selection:bg-blue-500/30">
+                  {output ? (
+                    <div className={output.includes('ERROR:') ? 'text-red-400' : 'text-slate-300'}>
+                      {output}
+                    </div>
+                  ) : (
+                    <div className="text-slate-600 select-none">No output yet. Run your code to see results here.</div>
+                  )}
                 </div>
               ) : (
-                <div className="text-slate-600 select-none">No output yet. Run your code to see results here.</div>
+                <textarea
+                  value={inputValue}
+                  onChange={(e) => setInputValue(e.target.value)}
+                  placeholder="Enter standard input here... (e.g., values for cin or input())"
+                  className="absolute inset-0 w-full h-full bg-[#1e1e1e] text-slate-300 p-4 font-mono text-sm resize-none focus:outline-none placeholder-slate-600 selection:bg-blue-500/30"
+                  spellCheck={false}
+                />
               )}
             </div>
           </div>
