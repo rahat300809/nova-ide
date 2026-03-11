@@ -32,8 +32,11 @@ RUN npm ci
 COPY server.ts ./
 COPY tsconfig*.json ./
 
-# Copy the pre-built frontend (built locally before docker push)
-COPY dist/ ./dist/
+# Copy all source files
+COPY . ./
+
+# Build the frontend assets so they exist in dist/
+RUN npm run build
 
 # Install tsx globally to run TypeScript server directly
 RUN npm install -g tsx typescript
