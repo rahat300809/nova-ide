@@ -48,6 +48,12 @@ io.on("connection", (socket) => {
     let command = "";
     let args: string[] = [];
 
+    // Inject C:\mingw64\bin into PATH for Windows local testing
+    const execEnv = { ...process.env };
+    if (process.platform === "win32") {
+      execEnv.PATH = `C:\\mingw64\\bin;${execEnv.PATH || ""}`;
+    }
+
     // Pre-compilation step for C/C++
     if (language === "c" || language === "cpp" || language === "c++") {
       const outPath = path.join(tempDir, "output.exe");
@@ -56,7 +62,7 @@ io.on("connection", (socket) => {
       socket.emit("output", `Compiling ${safeFileName}...\r\n`);
       
       try {
-        const compileProcess = spawn(compileCmd, [filePath, "-o", outPath]);
+        const compileProcess = spawn(compileCmd, [filePath, "-o", outPath], { env: execEnv });
         await new Promise((resolve, reject) => {
           compileProcess.on('close', (code) => {
             if (code === 0) resolve(true);
@@ -91,7 +97,7 @@ io.on("connection", (socket) => {
     }
 
     try {
-      currentProcess = spawn(command, args, { cwd: tempDir });
+      currentProcess = spawn(command, args, { cwd: tempDir, env: execEnv });
 
       currentProcess.stdout.on("data", (data: Buffer) => {
         // Convert \n to \r\n for xterm.js
