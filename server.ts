@@ -32,8 +32,8 @@ app.post("/api/run", async (req: any, res: any) => {
   
   try {
     if (language === "python" || language === "py") {
-      command = `python -c "${code.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`; // execute carefully or just use python filePath
-      command = `python ${filePath}`; 
+      command = `python3 -c "${code.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`; // execute carefully or just use python filePath
+      command = `python3 ${filePath}`; 
     } else if (language === "c") {
       const outPath = path.join(tempDir, "output.exe");
       command = `gcc ${filePath} -o ${outPath} && ${outPath}`;

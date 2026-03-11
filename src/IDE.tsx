@@ -21,6 +21,14 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
   const [searchTerm, setSearchTerm] = useState('');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  
+  // Custom Modal State
+  const [createModal, setCreateModal] = useState<{ isOpen: boolean; type: 'file' | 'folder'; parentId: string | null }>({
+    isOpen: false,
+    type: 'file',
+    parentId: null
+  });
+  const [createModalName, setCreateModalName] = useState('');
 
   // Auto language detection logic.
   const getLanguageFromExtension = (name: string) => {
@@ -35,14 +43,26 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
     return 'plaintext';
   };
 
-  const createFile = async (type: 'file' | 'folder', parentId: string | null = null) => {
-    const name = prompt(`Enter ${type} name:`);
+  const saveTimeoutRef = useRef<any>(null);
+
+  const openCreateModal = (type: 'file' | 'folder', parentId: string | null = null) => {
+    setCreateModal({ isOpen: true, type, parentId });
+    setCreateModalName('');
+  };
+
+  const handleCreateConfirm = async () => {
+    const { type, parentId } = createModal;
+    const name = createModalName.trim();
+    
+    setCreateModal({ isOpen: false, type: 'file', parentId: null });
+    setCreateModalName('');
+
     if (!name) return;
 
     const language = type === 'file' ? getLanguageFromExtension(name) : undefined;
     
     // Optimistic UI update
-    const tempId = Math.random().toString(36).substr(2, 9);
+    const tempId = 'temp_' + Math.random().toString(36).substr(2, 9);
     const newFileNode: FileNode = {
       id: tempId,
       name,
@@ -51,27 +71,37 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
       content: '',
       language
     };
-    setFiles([...files, newFileNode]);
+    setFiles((prev: any) => [...prev, newFileNode]);
     
     // Backend DB update
-    const docRef = await addDoc(collection(db, 'files'), {
-      userId: user.uid,
-      name,
-      type,
-      parentId,
-      content: '',
-      language,
-      createdAt: serverTimestamp()
-    });
+    try {
+      const docRef = await addDoc(collection(db, 'files'), {
+        userId: user.uid,
+        name,
+        type,
+        parentId,
+        content: '',
+        language,
+        createdAt: serverTimestamp()
+      });
 
-    // Update state with confirmed ID
-    setFiles((prev: any) => prev.map((f: any) => f.id === tempId ? { ...f, id: docRef.id } : f));
-    
-    if (type === 'file') {
-      setActiveFileId(docRef.id);
-      if (!openTabs.includes(docRef.id)) setOpenTabs([...openTabs, docRef.id]);
-    } else {
-      setExpandedFolders(new Set(expandedFolders).add(docRef.id));
+      // Update state with confirmed ID
+      setFiles((prev: any) => prev.map((f: any) => f.id === tempId ? { ...f, id: docRef.id } : f));
+      
+      if (type === 'file') {
+        setActiveFileId(docRef.id);
+        setOpenTabs((prev: any) => {
+          if (!prev.includes(docRef.id)) return [...prev, docRef.id];
+          return prev;
+        });
+      } else {
+        setExpandedFolders((prev: any) => new Set(prev).add(docRef.id));
+      }
+    } catch (e) {
+      console.error("Error creating file:", e);
+      // Revert optimistic update on failure
+      setFiles((prev: any) => prev.filter((f: any) => f.id !== tempId));
+      alert("Failed to create file. Please check your connection or permissions.");
     }
   };
 
@@ -79,22 +109,40 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
     if (!confirm('Are you sure you want to delete this?')) return;
     
     // DB
-    await deleteDoc(doc(db, 'files', id));
-    
-    // State
-    setFiles(files.filter((f: any) => f.id !== id && f.parentId !== id)); // note: shallow delete in state
-    setOpenTabs(openTabs.filter((tid: any) => tid !== id));
-    if (activeFileId === id) setActiveFileId(null);
+    try {
+      await deleteDoc(doc(db, 'files', id));
+      
+      // State
+      setFiles((prev: any) => prev.filter((f: any) => f.id !== id && f.parentId !== id)); 
+      setOpenTabs((prev: any) => prev.filter((tid: any) => tid !== id));
+      setActiveFileId((prev: any) => prev === id ? null : prev);
+    } catch (e) {
+      console.error("Error deleting document", e);
+      alert("Failed to delete file.");
+    }
   };
 
-  const updateFileContent = async (id: string, content: string) => {
-    setFiles(files.map((f: any) => f.id === id ? { ...f, content } : f));
+  const updateFileContent = (id: string, content: string) => {
+    // 1. Immediately update local state functionally so it doesn't rely on stale `files`
+    setFiles((prev: any) => prev.map((f: any) => f.id === id ? { ...f, content } : f));
+    
+    // 2. Clear any pending save
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+    
+    // 3. Debounce the Firestore write
     setIsSaving(true);
-    try {
-      await updateDoc(doc(db, 'files', id), { content });
-    } finally {
-      setTimeout(() => setIsSaving(false), 500);
-    }
+    saveTimeoutRef.current = setTimeout(async () => {
+      try {
+        // Double check it's not a tempId
+        if (!id.startsWith('temp_')) {
+          await updateDoc(doc(db, 'files', id), { content });
+        }
+      } catch (e) {
+        console.error("Error saving file", e);
+      } finally {
+        setIsSaving(false);
+      }
+    }, 1000);
   };
 
   const runCode = async () => {
@@ -208,8 +256,8 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
               <div className="hidden group-hover:flex items-center gap-0.5 ml-auto">
                 {node.type === 'folder' && (
                   <>
-                    <button onClick={(e) => { e.stopPropagation(); createFile('file', node.id); }} className="p-1 hover:bg-slate-300/50 rounded text-slate-500 hover:text-blue-600"><FilePlus size={12} /></button>
-                    <button onClick={(e) => { e.stopPropagation(); createFile('folder', node.id); }} className="p-1 hover:bg-slate-300/50 rounded text-slate-500 hover:text-blue-600"><FolderPlus size={12} /></button>
+                    <button onClick={(e) => { e.stopPropagation(); openCreateModal('file', node.id); }} className="p-1 hover:bg-slate-300/50 rounded text-slate-500 hover:text-blue-600"><FilePlus size={12} /></button>
+                    <button onClick={(e) => { e.stopPropagation(); openCreateModal('folder', node.id); }} className="p-1 hover:bg-slate-300/50 rounded text-slate-500 hover:text-blue-600"><FolderPlus size={12} /></button>
                   </>
                 )}
                 <button onClick={(e) => { e.stopPropagation(); deleteFile(node.id); }} className="p-1 hover:bg-red-100 rounded text-red-400 hover:text-red-600"><Trash2 size={12} /></button>
@@ -294,8 +342,8 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
                 <div className="flex items-center justify-between text-[11px] font-bold text-slate-500 uppercase tracking-wider">
                   <span>Explorer</span>
                   <div className="flex gap-1">
-                    <button onClick={() => createFile('file')} className="p-1 hover:bg-slate-200/50 rounded-md text-slate-600" title="New File"><FilePlus size={14} /></button>
-                    <button onClick={() => createFile('folder')} className="p-1 hover:bg-slate-200/50 rounded-md text-slate-600" title="New Folder"><FolderPlus size={14} /></button>
+                    <button onClick={() => openCreateModal('file')} className="p-1 hover:bg-slate-200/50 rounded-md text-slate-600" title="New File"><FilePlus size={14} /></button>
+                    <button onClick={() => openCreateModal('folder')} className="p-1 hover:bg-slate-200/50 rounded-md text-slate-600" title="New Folder"><FolderPlus size={14} /></button>
                   </div>
                 </div>
               </div>
@@ -374,7 +422,7 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
                 </div>
                 <p className="text-lg font-medium text-slate-600">Select a file to start coding</p>
                 <div className="flex gap-3 mt-6">
-                  <Button variant="secondary" onClick={() => createFile('file')} className="bg-white border-slate-200">New File</Button>
+                  <Button variant="secondary" onClick={() => openCreateModal('file')} className="bg-white border-slate-200">New File</Button>
                   {!isSidebarOpen && <Button variant="secondary" onClick={() => setIsSidebarOpen(true)}>Open Explorer</Button>}
                 </div>
               </div>
@@ -413,6 +461,68 @@ export function IDE({ user, files, setFiles, activeFileId, setActiveFileId, open
           </div>
         </main>
       </div>
+
+      {/* Creation Modal */}
+      <AnimatePresence>
+        {createModal.isOpen && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/20 backdrop-blur-sm"
+          >
+            <motion.div 
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-xl shadow-xl w-full max-w-sm overflow-hidden"
+            >
+              <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+                <h3 className="font-semibold text-slate-800">
+                  Create {createModal.type === 'file' ? 'File' : 'Folder'}
+                </h3>
+                <button 
+                  onClick={() => setCreateModal({ ...createModal, isOpen: false })}
+                  className="p-1 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-md transition-colors"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="p-5">
+                <input
+                  type="text"
+                  autoFocus
+                  placeholder={createModal.type === 'file' ? 'e.g., script.py' : 'e.g., src'}
+                  value={createModalName}
+                  onChange={(e) => setCreateModalName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') handleCreateConfirm();
+                    if (e.key === 'Escape') setCreateModal({ ...createModal, isOpen: false });
+                  }}
+                  className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all text-sm mb-4"
+                />
+                <div className="flex justify-end gap-2">
+                  <Button 
+                    variant="secondary" 
+                    onClick={() => setCreateModal({ ...createModal, isOpen: false })}
+                    className="h-9 px-4 py-0"
+                  >
+                    Cancel
+                  </Button>
+                  <Button 
+                    variant="primary" 
+                    onClick={handleCreateConfirm}
+                    disabled={!createModalName.trim()}
+                    className="h-9 px-4 py-0"
+                  >
+                    Create
+                  </Button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
